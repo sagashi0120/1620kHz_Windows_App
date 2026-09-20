@@ -1,9 +1,12 @@
 using Microsoft.Web.WebView2.WinForms;
+using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace _1620kHz_Windows_App
 {
@@ -16,27 +19,74 @@ namespace _1620kHz_Windows_App
         // ---- 単一インスタンス制御 ----
         private static readonly Mutex InstanceMutex;
         private static readonly bool IsFirstInstance;
-        private static readonly uint WM_SHOW_EXISTING;
-        private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
+        private static EventWaitHandle? ShowEvent;
+        private static EventWaitHandle? UpdateExitEvent;
 
-        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
-        private static extern uint RegisterWindowMessage(string lpString);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+        private const string MutexName = @"Local\1620kHz_Windows_App_Mutex";
+        private const string ShowEventName = @"Local\1620kHz_Windows_App_ShowEvent";
+        private const string UpdateExitEventName = @"Local\1620kHz_Windows_App_UpdateExit";
 
         static Form1()
         {
-            InstanceMutex = new Mutex(
-                initiallyOwned: true,
-                name: @"Local\1620kHz_Windows_App_SingleInstance",
-                createdNew: out bool createdNew);
-            IsFirstInstance = createdNew;
+            // Shift-JIS (CP932) を .NET Core で使えるようにする（バッチ書き出し用）
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
 
-            WM_SHOW_EXISTING = RegisterWindowMessage("1620kHz_Windows_App_ShowExisting");
+            // Mutex 取得（更新直後のクリーンアップラグ対策で最大 3 秒リトライ）
+            InstanceMutex = new Mutex(false, MutexName);
+            bool acquired = false;
+            for (int i = 0; i < 30; i++)
+            {
+                try
+                {
+                    if (InstanceMutex.WaitOne(100, false))
+                    {
+                        acquired = true;
+                        break;
+                    }
+                }
+                catch (AbandonedMutexException)
+                {
+                    // 前回プロセスが異常終了 → 自分がオーナーになる
+                    acquired = true;
+                    break;
+                }
+            }
+            IsFirstInstance = acquired;
+
+            if (IsFirstInstance)
+            {
+                ShowEvent = new EventWaitHandle(false, EventResetMode.AutoReset, ShowEventName);
+                UpdateExitEvent = new EventWaitHandle(false, EventResetMode.AutoReset, UpdateExitEventName);
+            }
+            else
+            {
+                // 既存インスタンスへ「表示して」とシグナル
+                SignalEventWithRetry(ShowEventName);
+            }
         }
 
-        // ---- デバッグログ（ファイル出力） ----
+        private static void SignalEventWithRetry(string eventName)
+        {
+            for (int i = 0; i < 10; i++)
+            {
+                try
+                {
+                    using var ev = EventWaitHandle.OpenExisting(eventName);
+                    ev.Set();
+                    return;
+                }
+                catch (WaitHandleCannotBeOpenedException)
+                {
+                    Thread.Sleep(50);
+                }
+                catch
+                {
+                    return;
+                }
+            }
+        }
+
+        // ---- デバッグログ ----
         private static readonly string LogPath =
             Path.Combine(Path.GetTempPath(), "1620khz_debug.log");
 
@@ -80,7 +130,6 @@ namespace _1620kHz_Windows_App
 
         private const int SW_RESTORE = 9;
 
-        //（Ctrl+Shift+H）
         private const uint HOTKEY_MODIFIERS = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
         private const uint HOTKEY_VK = 0x48; // 'H'
 
@@ -89,19 +138,19 @@ namespace _1620kHz_Windows_App
         private bool _hotkeyRegistered = false;
         private bool _userWantsShortcut = false;
 
-        private bool _realExit = false;
+        private volatile bool _realExit = false;
 
-        // 2つ目のインスタンスかどうか
         private readonly bool _isSecondInstance;
 
-        // ActivateFromHotkey のデバウンス用
+        // デバウンス用
         private DateTime _lastActivateUtc = DateTime.MinValue;
 
+        private Thread? _listenerThread;
+
         // バージョン
-        private const string VERSION = "0.3.1+--WebViewNative";
+        private const string VERSION = "0.3.2+--WebViewNative";
         private const string PAGE_URL = "https://highwayradio.cloudfree.jp/"; // debug: https://localhost, release: https://highwayradio.cloudfree.jp/
 
-        // バージョン文字列から数値部分だけを取り出す
         private static string NumericVersion
         {
             get
@@ -115,22 +164,19 @@ namespace _1620kHz_Windows_App
         {
             InitializeComponent();
 
-            // === 2つ目のインスタンス：既存インスタンスを前面化して静かに終了 ===
+            // === 2つ目のインスタンス：既存を起こして即終了 ===
             if (!IsFirstInstance)
             {
                 _isSecondInstance = true;
                 _realExit = true;
-
-                _ = Handle; // ハンドルを確実に作成（BeginInvoke のため）
-                PostMessage(HWND_BROADCAST, WM_SHOW_EXISTING, IntPtr.Zero, IntPtr.Zero);
-
-                // メッセージループ開始後に静かに閉じる
-                BeginInvoke(new Action(Close));
-                return;
+                Environment.Exit(0);
+                return; // 到達しない
             }
 
             try { File.WriteAllText(LogPath, ""); } catch { }
             Log("=== App Start ===");
+            Log("Version: " + VERSION);
+            Log("ProcessPath: " + (Environment.ProcessPath ?? "(null)"));
 
             Text = "ハイウェイラジオ 情報まとめ";
             Width = 1200;
@@ -164,6 +210,8 @@ namespace _1620kHz_Windows_App
 
             Load += async (_, _) =>
             {
+                StartBackgroundListeners();
+
                 try
                 {
                     var userDataFolder = Path.Combine(
@@ -188,8 +236,7 @@ namespace _1620kHz_Windows_App
                         string? source = e.Source;
                         Log("MSG SOURCE: " + (source ?? "(null)"));
 
-                        if (source == null ||
-                            !source.StartsWith(PAGE_URL))
+                        if (source == null || !source.StartsWith(PAGE_URL))
                             return;
 
                         string message;
@@ -238,6 +285,17 @@ namespace _1620kHz_Windows_App
                                 BeginInvoke(new Action(() => ShowVersionPopup()));
                                 break;
                         }
+
+                        // 自動アップデート用（"applyUpdate:<newExePath>"）
+                        if (message.StartsWith("applyUpdate:", StringComparison.Ordinal))
+                        {
+                            string newExe = message.Substring("applyUpdate:".Length).Trim();
+                            Log("applyUpdate received: " + newExe);
+
+                            bool started = RequestUpdateAndRestart(newExe);
+                            webView.CoreWebView2.PostWebMessageAsString(
+                                started ? "update:ok" : "update:failed");
+                        }
                     };
 
                     string js = $@"
@@ -247,7 +305,8 @@ namespace _1620kHz_Windows_App
                         }});
                     ";
                     await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(js);
-                    webView.CoreWebView2.Settings.UserAgent = webView.CoreWebView2.Settings.UserAgent + $" HighwayRadioApp/{VERSION}";
+                    webView.CoreWebView2.Settings.UserAgent =
+                        webView.CoreWebView2.Settings.UserAgent + $" HighwayRadioApp/{VERSION}";
                     webView.CoreWebView2.Navigate(PAGE_URL);
                 }
                 catch (Exception ex)
@@ -264,7 +323,6 @@ namespace _1620kHz_Windows_App
             };
         }
 
-        // 2つ目のインスタンスは一切表示させない
         protected override void SetVisibleCore(bool value)
         {
             if (_isSecondInstance)
@@ -273,6 +331,148 @@ namespace _1620kHz_Windows_App
                 return;
             }
             base.SetVisibleCore(value);
+        }
+
+        // ---- バックグラウンドリスナー ----
+        private void StartBackgroundListeners()
+        {
+            if (_listenerThread != null) return;
+
+            _listenerThread = new Thread(() =>
+            {
+                Log("BackgroundListeners started");
+                var handles = new WaitHandle[] { ShowEvent!, UpdateExitEvent! };
+
+                while (!_realExit)
+                {
+                    int idx;
+                    try { idx = WaitHandle.WaitAny(handles, 500); }
+                    catch { break; }
+
+                    if (_realExit) break;
+
+                    if (idx == 0)
+                    {
+                        Log("ShowEvent signaled");
+                        try { BeginInvoke(new Action(ActivateFromHotkey)); }
+                        catch (InvalidOperationException) { break; }
+                    }
+                    else if (idx == 1)
+                    {
+                        Log("UpdateExitEvent signaled");
+                        try
+                        {
+                            BeginInvoke(new Action(() =>
+                            {
+                                _realExit = true;
+                                Close();
+                            }));
+                        }
+                        catch { }
+                        break;
+                    }
+                }
+                Log("BackgroundListeners ended");
+            })
+            {
+                IsBackground = true,
+                Name = "BackgroundListeners"
+            };
+            _listenerThread.Start();
+        }
+
+        // ---- 自動アップデート ----
+        /// <summary>
+        /// ダウンロード済みの新 exe に差し替えて再起動する。
+        /// 呼び出し後、このインスタンスは（呼び出し元のモーダルが閉じた後に）終了する。
+        /// </summary>
+        /// <param name="newExePath">新バージョンの exe フルパス（%TEMP% 等）</param>
+        public bool RequestUpdateAndRestart(string newExePath)
+        {
+            try
+            {
+                if (string.IsNullOrWhiteSpace(newExePath) || !File.Exists(newExePath))
+                {
+                    Log("Update: new exe not found: " + newExePath);
+                    return false;
+                }
+
+                string currentExe = Environment.ProcessPath ?? Application.ExecutablePath;
+                int pid = Environment.ProcessId;
+
+                // 同一パスへの上書きは起動中は不可なので、別フォルダから渡す前提
+                if (string.Equals(
+                        Path.GetFullPath(newExePath),
+                        Path.GetFullPath(currentExe),
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    Log("Update: new exe path equals current exe path");
+                    return false;
+                }
+
+                Log($"Update: {newExePath} -> {currentExe} (pid={pid})");
+
+                string batPath = Path.Combine(
+                    Path.GetTempPath(), $"1620khz_update_{Guid.NewGuid():N}.bat");
+
+                // PID の消滅待ち → コピー（リトライ） → 新 exe 起動 → バッチ自己削除
+                string bat = $"""
+@echo off
+setlocal
+set "OLD_PID={pid}"
+set "NEW_EXE={newExePath}"
+set "CUR_EXE={currentExe}"
+
+:waitloop
+tasklist /FI "PID eq %OLD_PID%" 2>NUL | find "%OLD_PID%" >NUL
+if %errorlevel%==0 (
+    timeout /t 1 /nobreak >NUL
+    goto waitloop
+)
+
+set /a COPY_TRIES=0
+:copyretry
+copy /Y "%NEW_EXE%" "%CUR_EXE%" >NUL 2>&1
+if %errorlevel% neq 0 (
+    set /a COPY_TRIES+=1
+    if %COPY_TRIES% GEQ 30 (
+        echo Update failed: could not replace exe. > "%TEMP%\1620khz_update_error.txt"
+        goto cleanup
+    )
+    timeout /t 1 /nobreak >NUL
+    goto copyretry
+)
+
+start "" "%CUR_EXE%"
+
+:cleanup
+del "%~f0"
+""";
+                // 日本語パス対応で CP932 として書き出す
+                File.WriteAllText(batPath, bat, Encoding.GetEncoding(932));
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c \"\"{batPath}\"\"",
+                    CreateNoWindow = true,
+                    UseShellExecute = false,
+                    WindowStyle = ProcessWindowStyle.Hidden
+                });
+
+                // フラグだけ立てる。実際の Close は呼び出し元（ShowVersionPopup）が
+                // モーダルを閉じた後に BeginInvoke で行う。
+                _realExit = true;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("Update EXCEPTION: " + ex);
+                MessageBox.Show(this,
+                    "アップデートの適用に失敗しました:\n\n" + ex.Message,
+                    "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return false;
+            }
         }
 
         // ---- バージョンポップアップ ----
@@ -286,6 +486,13 @@ namespace _1620kHz_Windows_App
                 using var dlg = new VersionForm(VERSION, NumericVersion);
                 dlg.Icon = this.Icon;
                 dlg.ShowDialog(this);
+
+                // VersionForm 側で更新適用が予約された場合は自身を閉じる
+                if (_realExit)
+                {
+                    Log("ShowVersionPopup: _realExit=true -> closing Form1");
+                    BeginInvoke(new Action(Close));
+                }
             }
             catch (Exception ex)
             {
@@ -317,7 +524,7 @@ namespace _1620kHz_Windows_App
             trayIcon.DoubleClick += (_, _) => ActivateFromHotkey();
         }
 
-        private async System.Threading.Tasks.Task ApplyShortcutStateAsync()
+        private async Task ApplyShortcutStateAsync()
         {
             if (webView.CoreWebView2 == null) return;
 
@@ -405,7 +612,6 @@ namespace _1620kHz_Windows_App
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            // 2つ目のインスタンスはトレイもWebViewも初期化していない
             if (_isSecondInstance)
             {
                 base.OnFormClosing(e);
@@ -416,10 +622,10 @@ namespace _1620kHz_Windows_App
             if (!_realExit)
             {
                 Log("OnFormClosing (DEBUG: exiting)");
-                trayIcon!.Visible = false;
-                trayIcon.Dispose();
-                trayMenu?.Dispose();
-                webView.Dispose();
+                try { trayIcon!.Visible = false; } catch { }
+                try { trayIcon?.Dispose(); } catch { }
+                try { trayMenu?.Dispose(); } catch { }
+                try { webView.Dispose(); } catch { }
                 base.OnFormClosing(e);
                 return;
             }
@@ -434,24 +640,35 @@ namespace _1620kHz_Windows_App
                 return;
             }
 
-            trayIcon!.Visible = false;
-            trayIcon.Dispose();
-            trayMenu?.Dispose();
-            webView.Dispose();
+            // 完全終了時のクリーンアップ
+            _realExit = true;
+
+            try { trayIcon!.Visible = false; } catch { }
+            try { trayIcon?.Dispose(); } catch { }
+            try { trayMenu?.Dispose(); } catch { }
+            try { webView.Dispose(); } catch { }
+
+            try
+            {
+                ShowEvent?.Dispose();
+                ShowEvent = null;
+            }
+            catch { }
+
+            try
+            {
+                UpdateExitEvent?.Dispose();
+                UpdateExitEvent = null;
+            }
+            catch { }
+
+            try { InstanceMutex.ReleaseMutex(); } catch { }
 
             base.OnFormClosing(e);
         }
 
         protected override void WndProc(ref Message m)
         {
-            // 2つ目のインスタンスからの「前面に出て」要求
-            if ((uint)m.Msg == WM_SHOW_EXISTING)
-            {
-                Log("WM_SHOW_EXISTING received");
-                ActivateFromHotkey();
-                return;
-            }
-
             if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
             {
                 Log("WM_HOTKEY received");
@@ -463,7 +680,7 @@ namespace _1620kHz_Windows_App
 
         private void ActivateFromHotkey()
         {
-            // 連続起動（二重に開いたように見える挙動）を防ぐデバウンス
+            // デバウンス（連続シグナルのちらつき防止）
             var now = DateTime.UtcNow;
             if ((now - _lastActivateUtc).TotalMilliseconds < 250)
             {
@@ -480,7 +697,6 @@ namespace _1620kHz_Windows_App
 
             ShowInTaskbar = true;
 
-            // 既にアクティブなら余計な再アクティブ化をしない（ちらつき防止）
             if (Form.ActiveForm != this)
             {
                 Activate();

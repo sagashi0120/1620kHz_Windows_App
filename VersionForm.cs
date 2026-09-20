@@ -186,12 +186,13 @@ namespace _1620kHz_Windows_App
             }
             finally
             {
-                btnCheck.Enabled = true;
+                if (!IsDisposed) btnCheck.Enabled = true;
             }
         }
 
         /// <summary>
-        /// 新しい exe をダウンロードし、バッチ経由で自分自身を置き換える
+        /// 新しい exe を %TEMP% にダウンロードし、Form1 に更新適用を依頼する。
+        /// 実際のファイル差し替えは Form1.RequestUpdateAndRestart が担当。
         /// </summary>
         private async System.Threading.Tasks.Task DownloadAndInstallAsync()
         {
@@ -213,17 +214,17 @@ namespace _1620kHz_Windows_App
             btnClose.Enabled = false;
             lblStatus.Text = "ダウンロード中...";
 
+            string tempDir = Path.Combine(Path.GetTempPath(), "HighwayRadioUpdate");
+            string newExe = Path.Combine(tempDir, "1620kHz-Windows-App.exe");
+
             try
             {
                 // 一時フォルダ準備
-                string tempDir = Path.Combine(Path.GetTempPath(), "HighwayRadioUpdate");
                 if (Directory.Exists(tempDir))
                 {
-                    try { Directory.Delete(tempDir, true); } catch { /* 失敗しても続行 */ }
+                    try { Directory.Delete(tempDir, true); } catch { /* 続行 */ }
                 }
                 Directory.CreateDirectory(tempDir);
-
-                string newExe = Path.Combine(tempDir, "1620kHz-Windows-App.exe");
 
                 // ダウンロード（進捗付き）
                 using (var response = await http.GetAsync(_downloadUrl,
@@ -243,6 +244,8 @@ namespace _1620kHz_Windows_App
                         await dst.WriteAsync(buffer.AsMemory(0, n));
                         read += n;
 
+                        if (IsDisposed) return;
+
                         if (total.HasValue && total.Value > 0)
                         {
                             int pct = (int)(read * 100 / total.Value);
@@ -255,49 +258,43 @@ namespace _1620kHz_Windows_App
                     }
                 }
 
+                if (IsDisposed) return;
+
                 lblStatus.Text = "更新を適用しています...";
 
-                // 自分自身のパスと PID
-                string currentExe = Application.ExecutablePath;
-                int pid = System.Diagnostics.Process.GetCurrentProcess().Id;
-
-                // 置き換え用バッチを生成
-                // 仕組み:
-                //   1. 自分のプロセス (PID) が終了するまでループで待つ
-                //   2. 新しい exe を元の場所にコピー
-                //   3. 新しい exe を起動
-                //   4. 一時ファイルとバッチ自身を削除
-                string batPath = Path.Combine(tempDir, "update.bat");
-                string bat = $@"@echo off
-:waitloop
-tasklist /FI ""PID eq {pid}"" 2>NUL | find ""{pid}"" >NUL
-if not errorlevel 1 (
-    timeout /t 1 /nobreak >nul
-    goto waitloop
-)
-copy /Y ""{newExe}"" ""{currentExe}""
-start """" ""{currentExe}""
-del ""{newExe}""
-del ""%~f0""
-";
-
-                // 日本語パス対応で ANSI コードページ (通常 CP932) で書き出す
-                File.WriteAllText(batPath, bat, Encoding.GetEncoding(0));
-
-                // バッチを非表示で起動
-                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                // Form1 に更新適用を依頼
+                var owner = Owner as Form1;
+                if (owner == null)
                 {
-                    FileName = batPath,
-                    UseShellExecute = true,
-                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
-                    CreateNoWindow = true,
-                });
+                    lblStatus.Text = "更新の適用に失敗しました（内部エラー）。";
+                    MessageBox.Show(this,
+                        "更新の適用に失敗しました。\n" +
+                        "（Form1 への参照を取得できませんでした）",
+                        "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    btnCheck.Enabled = true;
+                    btnDownload.Enabled = true;
+                    btnClose.Enabled = true;
+                    return;
+                }
 
-                // 自分を終了
-                Application.Exit();
+                bool ok = owner.RequestUpdateAndRestart(newExe);
+
+                if (ok)
+                {
+                    // モーダルを閉じる。後続は ShowVersionPopup 側で処理される。
+                    DialogResult = DialogResult.OK;
+                }
+                else
+                {
+                    // RequestUpdateAndRestart 側で MessageBox 済み
+                    btnCheck.Enabled = true;
+                    btnDownload.Enabled = true;
+                    btnClose.Enabled = true;
+                }
             }
             catch (Exception ex)
             {
+                if (IsDisposed) return;
                 lblStatus.Text = "更新に失敗しました: " + ex.Message;
                 MessageBox.Show(this,
                     "更新に失敗しました。\n\n" + ex.Message,
