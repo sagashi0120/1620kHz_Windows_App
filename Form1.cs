@@ -3,6 +3,7 @@ using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace _1620kHz_Windows_App
 {
@@ -11,6 +12,29 @@ namespace _1620kHz_Windows_App
         private readonly WebView2 webView = new();
         private NotifyIcon? trayIcon;
         private ContextMenuStrip? trayMenu;
+
+        // ---- 単一インスタンス制御 ----
+        private static readonly Mutex InstanceMutex;
+        private static readonly bool IsFirstInstance;
+        private static readonly uint WM_SHOW_EXISTING;
+        private static readonly IntPtr HWND_BROADCAST = new IntPtr(0xFFFF);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        static Form1()
+        {
+            InstanceMutex = new Mutex(
+                initiallyOwned: true,
+                name: @"Local\1620kHz_Windows_App_SingleInstance",
+                createdNew: out bool createdNew);
+            IsFirstInstance = createdNew;
+
+            WM_SHOW_EXISTING = RegisterWindowMessage("1620kHz_Windows_App_ShowExisting");
+        }
 
         // ---- デバッグログ（ファイル出力） ----
         private static readonly string LogPath =
@@ -67,8 +91,14 @@ namespace _1620kHz_Windows_App
 
         private bool _realExit = false;
 
+        // 2つ目のインスタンスかどうか
+        private readonly bool _isSecondInstance;
+
+        // ActivateFromHotkey のデバウンス用
+        private DateTime _lastActivateUtc = DateTime.MinValue;
+
         // バージョン
-        private const string VERSION = "0.3.0+--WebViewNative";
+        private const string VERSION = "0.3.1+--WebViewNative";
         private const string PAGE_URL = "https://highwayradio.cloudfree.jp/"; // debug: https://localhost, release: https://highwayradio.cloudfree.jp/
 
         // バージョン文字列から数値部分だけを取り出す
@@ -84,6 +114,20 @@ namespace _1620kHz_Windows_App
         public Form1()
         {
             InitializeComponent();
+
+            // === 2つ目のインスタンス：既存インスタンスを前面化して静かに終了 ===
+            if (!IsFirstInstance)
+            {
+                _isSecondInstance = true;
+                _realExit = true;
+
+                _ = Handle; // ハンドルを確実に作成（BeginInvoke のため）
+                PostMessage(HWND_BROADCAST, WM_SHOW_EXISTING, IntPtr.Zero, IntPtr.Zero);
+
+                // メッセージループ開始後に静かに閉じる
+                BeginInvoke(new Action(Close));
+                return;
+            }
 
             try { File.WriteAllText(LogPath, ""); } catch { }
             Log("=== App Start ===");
@@ -220,6 +264,17 @@ namespace _1620kHz_Windows_App
             };
         }
 
+        // 2つ目のインスタンスは一切表示させない
+        protected override void SetVisibleCore(bool value)
+        {
+            if (_isSecondInstance)
+            {
+                base.SetVisibleCore(false);
+                return;
+            }
+            base.SetVisibleCore(value);
+        }
+
         // ---- バージョンポップアップ ----
         private void ShowVersionPopup()
         {
@@ -228,7 +283,7 @@ namespace _1620kHz_Windows_App
                 if (!Visible) Show();
                 ShowInTaskbar = true;
 
-                using var dlg = new VersionForm(VERSION,NumericVersion);
+                using var dlg = new VersionForm(VERSION, NumericVersion);
                 dlg.Icon = this.Icon;
                 dlg.ShowDialog(this);
             }
@@ -350,6 +405,13 @@ namespace _1620kHz_Windows_App
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
+            // 2つ目のインスタンスはトレイもWebViewも初期化していない
+            if (_isSecondInstance)
+            {
+                base.OnFormClosing(e);
+                return;
+            }
+
 #if DEBUG
             if (!_realExit)
             {
@@ -365,7 +427,7 @@ namespace _1620kHz_Windows_App
 
             if (!_realExit && e.CloseReason == CloseReason.UserClosing)
             {
-                // ★ バルーン通知は削除。静かにトレイへ。
+                // ★ 静かにトレイへ
                 e.Cancel = true;
                 Hide();
                 ShowInTaskbar = false;
@@ -382,6 +444,14 @@ namespace _1620kHz_Windows_App
 
         protected override void WndProc(ref Message m)
         {
+            // 2つ目のインスタンスからの「前面に出て」要求
+            if ((uint)m.Msg == WM_SHOW_EXISTING)
+            {
+                Log("WM_SHOW_EXISTING received");
+                ActivateFromHotkey();
+                return;
+            }
+
             if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
             {
                 Log("WM_HOTKEY received");
@@ -393,14 +463,29 @@ namespace _1620kHz_Windows_App
 
         private void ActivateFromHotkey()
         {
-            if (!Visible) Show();
-            ShowInTaskbar = true;
-            if (WindowState == FormWindowState.Minimized)
-                ShowWindow(Handle, SW_RESTORE);
+            // 連続起動（二重に開いたように見える挙動）を防ぐデバウンス
+            var now = DateTime.UtcNow;
+            if ((now - _lastActivateUtc).TotalMilliseconds < 250)
+            {
+                Log("ActivateFromHotkey debounced");
+                return;
+            }
+            _lastActivateUtc = now;
 
-            Activate();
-            SetForegroundWindow(Handle);
-            BringToFront();
+            if (WindowState == FormWindowState.Minimized)
+                WindowState = FormWindowState.Normal;
+
+            if (!Visible)
+                Show();
+
+            ShowInTaskbar = true;
+
+            // 既にアクティブなら余計な再アクティブ化をしない（ちらつき防止）
+            if (Form.ActiveForm != this)
+            {
+                Activate();
+                SetForegroundWindow(Handle);
+            }
         }
 
         private static int ToColorRef(Color c) => c.R | (c.G << 8) | (c.B << 16);
