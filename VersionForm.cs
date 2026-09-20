@@ -1,6 +1,8 @@
 ﻿using System.Drawing;
+using System.IO;
 using System.Net.Http;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
 
@@ -22,14 +24,21 @@ namespace _1620kHz_Windows_App
         private Button btnClose = null!;
 
         private string? _downloadUrl;
+        private string? _latestVersion;
 
-        private static readonly HttpClient http = new() { Timeout = TimeSpan.FromSeconds(10) };
+        private static readonly HttpClient http = new() { Timeout = TimeSpan.FromMinutes(10) };
 
         // ---- DWM（ダークタイトルバー） ----
         [DllImport("dwmapi.dll")]
         private static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr,
             ref int attrValue, int attrSize);
         private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+        static VersionForm()
+        {
+            // Shift-JIS (CP932) を .NET Core で使えるようにする
+            Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+        }
 
         public VersionForm(string currentVersion, string currentVersionNumeric)
         {
@@ -88,7 +97,7 @@ namespace _1620kHz_Windows_App
 
             btnDownload = new Button
             {
-                Text = "ダウンロード",
+                Text = "更新する",
                 Location = new Point(20, 150),
                 Size = new Size(130, 32),
                 BackColor = Color.FromArgb(0, 120, 60),
@@ -97,7 +106,7 @@ namespace _1620kHz_Windows_App
                 Visible = false
             };
             btnDownload.FlatAppearance.BorderSize = 0;
-            btnDownload.Click += (_, _) => OpenDownloadUrl();
+            btnDownload.Click += async (_, _) => await DownloadAndInstallAsync();
 
             btnClose = new Button
             {
@@ -160,12 +169,14 @@ namespace _1620kHz_Windows_App
 
                 if (IsNewerVersion(_currentVersionNumeric, latest))
                 {
+                    _latestVersion = latest;
                     lblStatus.Text = $"新しいバージョン {latest} が利用可能です。";
                     _downloadUrl = $"{DOWNLOAD_BASE}/{latest}/1620kHz-Windows-App.exe";
                     btnDownload.Visible = true;
                 }
                 else
                 {
+                    _latestVersion = null;
                     lblStatus.Text = "最新バージョンです。";
                 }
             }
@@ -179,21 +190,122 @@ namespace _1620kHz_Windows_App
             }
         }
 
-        private void OpenDownloadUrl()
+        /// <summary>
+        /// 新しい exe をダウンロードし、バッチ経由で自分自身を置き換える
+        /// </summary>
+        private async System.Threading.Tasks.Task DownloadAndInstallAsync()
         {
-            if (string.IsNullOrEmpty(_downloadUrl)) return;
+            if (string.IsNullOrEmpty(_downloadUrl) || string.IsNullOrEmpty(_latestVersion))
+                return;
+
+            var confirm = MessageBox.Show(this,
+                $"バージョン {_latestVersion} に更新します。\n\n" +
+                "更新後、アプリは自動的に再起動します。\n" +
+                "よろしいですか？",
+                "アップデートの確認",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Question);
+
+            if (confirm != DialogResult.Yes) return;
+
+            btnCheck.Enabled = false;
+            btnDownload.Enabled = false;
+            btnClose.Enabled = false;
+            lblStatus.Text = "ダウンロード中...";
+
             try
             {
+                // 一時フォルダ準備
+                string tempDir = Path.Combine(Path.GetTempPath(), "HighwayRadioUpdate");
+                if (Directory.Exists(tempDir))
+                {
+                    try { Directory.Delete(tempDir, true); } catch { /* 失敗しても続行 */ }
+                }
+                Directory.CreateDirectory(tempDir);
+
+                string newExe = Path.Combine(tempDir, "1620kHz-Windows-App.exe");
+
+                // ダウンロード（進捗付き）
+                using (var response = await http.GetAsync(_downloadUrl,
+                    HttpCompletionOption.ResponseHeadersRead))
+                {
+                    response.EnsureSuccessStatusCode();
+                    long? total = response.Content.Headers.ContentLength;
+
+                    using var src = await response.Content.ReadAsStreamAsync();
+                    using var dst = File.Create(newExe);
+
+                    var buffer = new byte[81920];
+                    long read = 0;
+                    int n;
+                    while ((n = await src.ReadAsync(buffer.AsMemory())) > 0)
+                    {
+                        await dst.WriteAsync(buffer.AsMemory(0, n));
+                        read += n;
+
+                        if (total.HasValue && total.Value > 0)
+                        {
+                            int pct = (int)(read * 100 / total.Value);
+                            lblStatus.Text = $"ダウンロード中... {pct}%";
+                        }
+                        else
+                        {
+                            lblStatus.Text = $"ダウンロード中... {read / 1024 / 1024} MB";
+                        }
+                    }
+                }
+
+                lblStatus.Text = "更新を適用しています...";
+
+                // 自分自身のパスと PID
+                string currentExe = Application.ExecutablePath;
+                int pid = System.Diagnostics.Process.GetCurrentProcess().Id;
+
+                // 置き換え用バッチを生成
+                // 仕組み:
+                //   1. 自分のプロセス (PID) が終了するまでループで待つ
+                //   2. 新しい exe を元の場所にコピー
+                //   3. 新しい exe を起動
+                //   4. 一時ファイルとバッチ自身を削除
+                string batPath = Path.Combine(tempDir, "update.bat");
+                string bat = $@"@echo off
+:waitloop
+tasklist /FI ""PID eq {pid}"" 2>NUL | find ""{pid}"" >NUL
+if not errorlevel 1 (
+    timeout /t 1 /nobreak >nul
+    goto waitloop
+)
+copy /Y ""{newExe}"" ""{currentExe}""
+start """" ""{currentExe}""
+del ""{newExe}""
+del ""%~f0""
+";
+
+                // 日本語パス対応で ANSI コードページ (通常 CP932) で書き出す
+                File.WriteAllText(batPath, bat, Encoding.GetEncoding(0));
+
+                // バッチを非表示で起動
                 System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
                 {
-                    FileName = _downloadUrl,
-                    UseShellExecute = true
+                    FileName = batPath,
+                    UseShellExecute = true,
+                    WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden,
+                    CreateNoWindow = true,
                 });
+
+                // 自分を終了
+                Application.Exit();
             }
             catch (Exception ex)
             {
-                MessageBox.Show(this, "ブラウザを開けませんでした: " + ex.Message,
+                lblStatus.Text = "更新に失敗しました: " + ex.Message;
+                MessageBox.Show(this,
+                    "更新に失敗しました。\n\n" + ex.Message,
                     "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+                btnCheck.Enabled = true;
+                btnDownload.Enabled = true;
+                btnClose.Enabled = true;
             }
         }
 

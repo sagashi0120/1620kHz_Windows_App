@@ -68,7 +68,7 @@ namespace _1620kHz_Windows_App
         private bool _realExit = false;
 
         // バージョン
-        private const string VERSION = "0.2.0+--WebViewNative";
+        private const string VERSION = "0.3.0+--WebViewNative";
         private const string PAGE_URL = "https://highwayradio.cloudfree.jp/"; // debug: https://localhost, release: https://highwayradio.cloudfree.jp/
 
         // バージョン文字列から数値部分だけを取り出す
