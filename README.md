@@ -24,11 +24,6 @@ WebView2 を利用してサイトを表示し、ブラウザでは実現でき�
 > - Windows 11、および更新済みの Windows 10 には **WebView2 Runtime が標準搭載**されています。
 > - WebView2 が見つからない場合は、起動時にダウンロードページを案内します。
 
-## インストール
-
-> **.NET 10 ランタイムが必要です**
-> 未インストールの場合は [.NET 10 ダウンロードページ](https://dotnet.microsoft.com/ja-jp/download/dotnet/10.0) から「デスクトップ ランタイム」をインストールしてください。
-
 ## 使い方
 
 ### 起動
@@ -77,19 +72,13 @@ dotnet build -c Release
 ### 配布用パッケージ作成
 
 ```powershell
-dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
+dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 ```
 
 出力先：
 ```
 bin\Release\net10.0-windows\win-x64\publish\
 ```
-
-### 必要ファイル（配布時）
-
-- `1620kHz-Windows-App.exe`
-- `WebView2Loader.dll`
-- `runtimes\` フォルダ
 
 ## ライセンス
 
