@@ -24,6 +24,8 @@ WebView2 を利用してサイトを表示し、ブラウザでは実現でき�
 > - Windows 11、および更新済みの Windows 10 には **WebView2 Runtime が標準搭載**されています。
 > - WebView2 が見つからない場合は、起動時にダウンロードページを案内します。
 
+## インストール
+
 > **.NET 10 ランタイムが必要です**
 > 未インストールの場合は [.NET 10 ダウンロードページ](https://dotnet.microsoft.com/ja-jp/download/dotnet/10.0) から「デスクトップ ランタイム」をインストールしてください。
 
@@ -60,3 +62,40 @@ WebView2 を利用してサイトを表示し、ブラウザでは実現でき�
 1. タスクトレイアイコンを右クリック → 「終了」
 2. 解凍したフォルダを削除
 3. 以下のフォルダにユーザーデータが保存されているので、必要に応じて削除
+   ```
+   %LOCALAPPDATA%\1620kHz_Windows_App
+   ```
+
+## 開発
+
+### ビルド
+
+```powershell
+dotnet build -c Release
+```
+
+### 配布用パッケージ作成
+
+```powershell
+dotnet publish -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true
+```
+
+出力先：
+```
+bin\Release\net10.0-windows\win-x64\publish\
+```
+
+### 必要ファイル（配布時）
+
+- `1620kHz-Windows-App.exe`
+- `WebView2Loader.dll`
+- `runtimes\` フォルダ
+
+## ライセンス
+
+[LICENSE](LICENSE) を参照してください。
+
+## リンク
+
+- [ハイウェイラジオ 情報まとめ](https://highwayradio.cloudfree.jp/)
+- [不具合報告・要望](https://github.com/sagashi0120/1620kHz_Windows_App/issues)
