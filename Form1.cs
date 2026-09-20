@@ -1,12 +1,30 @@
 using Microsoft.Web.WebView2.WinForms;
 using System.Drawing;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 
 namespace _1620kHz_Windows_App
 {
     public partial class Form1 : Form
     {
         private readonly WebView2 webView = new();
+        private NotifyIcon? trayIcon;
+        private ContextMenuStrip? trayMenu;
+
+        // ---- デバッグログ（ファイル出力） ----
+        private static readonly string LogPath =
+            Path.Combine(Path.GetTempPath(), "1620khz_debug.log");
+
+        private static void Log(string msg)
+        {
+            try
+            {
+                File.AppendAllText(LogPath,
+                    $"[{DateTime.Now:HH:mm:ss.fff}] {msg}\r\n");
+            }
+            catch { }
+        }
 
         // ---- DWM ----
         [DllImport("dwmapi.dll")]
@@ -33,34 +51,50 @@ namespace _1620kHz_Windows_App
         private const uint MOD_ALT = 0x0001;
         private const uint MOD_CONTROL = 0x0002;
         private const uint MOD_SHIFT = 0x0004;
+        private const uint MOD_WIN = 0x0008;
         private const uint MOD_NOREPEAT = 0x4000;
 
         private const int SW_RESTORE = 9;
 
-        //（Ctrl+Alt+H）
-        private const uint HOTKEY_MODIFIERS = MOD_CONTROL | MOD_ALT | MOD_NOREPEAT;
+        //（Ctrl+Shift+H）
+        private const uint HOTKEY_MODIFIERS = MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT;
         private const uint HOTKEY_VK = 0x48; // 'H'
 
         // 状態管理
         private bool _shortcutEnabled = false;
         private bool _hotkeyRegistered = false;
+        private bool _userWantsShortcut = false;
+
+        private bool _realExit = false;
 
         // バージョン
-        private const string VERSION = "0.1.0+--WebViewNative";
+        private const string VERSION = "0.2.0+--WebViewNative";
+        private const string PAGE_URL = "https://highwayradio.cloudfree.jp/"; // debug: https://localhost, release: https://highwayradio.cloudfree.jp/
+
+        // バージョン文字列から数値部分だけを取り出す
+        private static string NumericVersion
+        {
+            get
+            {
+                var m = Regex.Match(VERSION, @"^\d+(\.\d+)*");
+                return m.Success ? m.Value : VERSION;
+            }
+        }
 
         public Form1()
         {
             InitializeComponent();
 
+            try { File.WriteAllText(LogPath, ""); } catch { }
+            Log("=== App Start ===");
+
             Text = "ハイウェイラジオ 情報まとめ";
             Width = 1200;
             Height = 800;
 
-            // ---- WebView2 ----
             webView.Dock = DockStyle.Fill;
             Controls.Add(webView);
 
-            // アプリがアクティブなときのショートカット
             KeyPreview = true;
             KeyDown += (_, e) =>
             {
@@ -82,61 +116,152 @@ namespace _1620kHz_Windows_App
                 }
             };
 
+            SetupTrayIcon();
+
             Load += async (_, _) =>
             {
-                await webView.EnsureCoreWebView2Async();
-
-                webView.CoreWebView2.DocumentTitleChanged += (s, e) => Text = webView.CoreWebView2.DocumentTitle;
-
-                // ページ遷移後、現在のショートカット状態をページへ反映
-                webView.CoreWebView2.NavigationCompleted += async (s, e) =>
+                try
                 {
-                    await ApplyShortcutStateAsync();
-                };
+                    var userDataFolder = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                        "1620kHz_Windows_App");
+                    var env = await Microsoft.Web.WebView2.Core.CoreWebView2Environment.CreateAsync(
+                        null, userDataFolder);
+                    await webView.EnsureCoreWebView2Async(env);
+                    Log("WebView2 initialized");
 
-                // ページ → アプリ
-                webView.CoreWebView2.WebMessageReceived += async (s, e) =>
-                {
-                    string source = e.Source;
-                    if (!source.StartsWith("https://highwayradio.cloudfree.jp/"))
-                        return;
+                    webView.CoreWebView2.DocumentTitleChanged += (s, e) =>
+                        Text = webView.CoreWebView2.DocumentTitle;
 
-                    string message = e.TryGetWebMessageAsString();
-                    System.Diagnostics.Debug.WriteLine("MSG FROM WEB: " + message);
-
-                    switch (message)
+                    webView.CoreWebView2.NavigationCompleted += async (s, e) =>
                     {
-                        case "enableShortcut":
-                            bool ok = EnableShortcut();
-                            await ApplyShortcutStateAsync();
-                            webView.CoreWebView2.PostWebMessageAsString(
-                                ok ? "shortcut:true" : "shortcut:failed");
-                            break;
-                        case "disableShortcut":
-                            DisableShortcut();
-                            await ApplyShortcutStateAsync();
-                            webView.CoreWebView2.PostWebMessageAsString("shortcut:false");
-                            break;
-                        case "queryShortcutState":
-                            webView.CoreWebView2.PostWebMessageAsString(
-                                _shortcutEnabled ? "shortcut:true" : "shortcut:false");
-                            break;
-                    }
-                };
+                        Log("NavigationCompleted: " + webView.CoreWebView2.Source);
+                        await ApplyShortcutStateAsync();
+                    };
 
-                // 初期状態：shortcut: false
-                string js = $@"
-                    window.APP_INFO_WEBVIEW = Object.freeze({{
-                        version: '{VERSION}',
-                        shortcut: false
-                    }});
-                ";
-                await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(js);
-                webView.CoreWebView2.Navigate("https://highwayradio.cloudfree.jp/");
+                    webView.CoreWebView2.WebMessageReceived += async (s, e) =>
+                    {
+                        string? source = e.Source;
+                        Log("MSG SOURCE: " + (source ?? "(null)"));
+
+                        if (source == null ||
+                            !source.StartsWith(PAGE_URL))
+                            return;
+
+                        string message;
+                        try
+                        {
+                            message = e.TryGetWebMessageAsString();
+                        }
+                        catch
+                        {
+                            Log("MSG non-string, ignored");
+                            return;
+                        }
+
+                        Log("MSG FROM WEB: " + message);
+
+                        switch (message)
+                        {
+                            case "enableShortcut":
+                                bool ok = EnableShortcut();
+                                await ApplyShortcutStateAsync();
+                                if (!ok)
+                                {
+                                    trayIcon?.ShowBalloonTip(
+                                        3000,
+                                        "ショートカット登録失敗",
+                                        "Ctrl+Shift+H は他アプリと衝突しています。",
+                                        ToolTipIcon.Warning);
+                                }
+                                webView.CoreWebView2.PostWebMessageAsString(
+                                    ok ? "shortcut:true" : "shortcut:failed");
+                                break;
+
+                            case "disableShortcut":
+                                DisableShortcut();
+                                await ApplyShortcutStateAsync();
+                                webView.CoreWebView2.PostWebMessageAsString("shortcut:false");
+                                break;
+
+                            case "queryShortcutState":
+                                webView.CoreWebView2.PostWebMessageAsString(
+                                    _shortcutEnabled ? "shortcut:true" : "shortcut:false");
+                                break;
+
+                            case "showPopupVersion":
+                                Log("showPopupVersion received (deferring)");
+                                BeginInvoke(new Action(() => ShowVersionPopup()));
+                                break;
+                        }
+                    };
+
+                    string js = $@"
+                        window.APP_INFO_WEBVIEW = Object.freeze({{
+                            version: '{VERSION}',
+                            shortcut: false
+                        }});
+                    ";
+                    await webView.CoreWebView2.AddScriptToExecuteOnDocumentCreatedAsync(js);
+                    webView.CoreWebView2.Settings.UserAgent = webView.CoreWebView2.Settings.UserAgent + $" HighwayRadioApp/{VERSION}";
+                    webView.CoreWebView2.Navigate(PAGE_URL);
+                }
+                catch (Exception ex)
+                {
+                    Log("WebView2 init FAILED: " + ex);
+                    MessageBox.Show(
+                        "WebView2 の初期化に失敗しました。\n" +
+                        "Microsoft Edge WebView2 Runtime がインストールされているか確認してください。\n\n" +
+                        ex.Message,
+                        "起動エラー",
+                        MessageBoxButtons.OK,
+                        MessageBoxIcon.Error);
+                }
             };
         }
 
-        // ---- ページに現在のショートカット状態を反映 ----
+        // ---- バージョンポップアップ ----
+        private void ShowVersionPopup()
+        {
+            try
+            {
+                if (!Visible) Show();
+                ShowInTaskbar = true;
+
+                using var dlg = new VersionForm(VERSION,NumericVersion);
+                dlg.Icon = this.Icon;
+                dlg.ShowDialog(this);
+            }
+            catch (Exception ex)
+            {
+                Log("ShowVersionPopup EXCEPTION: " + ex);
+                MessageBox.Show(this,
+                    "バージョンポップアップでエラーが発生しました:\n\n" + ex,
+                    "エラー", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private void SetupTrayIcon()
+        {
+            trayMenu = new ContextMenuStrip();
+            trayMenu.Items.Add("開く(&O)", null, (_, _) => ActivateFromHotkey());
+            trayMenu.Items.Add(new ToolStripSeparator());
+            trayMenu.Items.Add("終了(&X)", null, (_, _) =>
+            {
+                _realExit = true;
+                Close();
+            });
+
+            trayIcon = new NotifyIcon
+            {
+                Icon = Icon ?? SystemIcons.Application,
+                Text = "ハイウェイラジオ 情報まとめ",
+                Visible = true,
+                ContextMenuStrip = trayMenu
+            };
+            trayIcon.DoubleClick += (_, _) => ActivateFromHotkey();
+        }
+
         private async System.Threading.Tasks.Task ApplyShortcutStateAsync()
         {
             if (webView.CoreWebView2 == null) return;
@@ -152,11 +277,13 @@ namespace _1620kHz_Windows_App
                 }}));
             ";
             await webView.CoreWebView2.ExecuteScriptAsync(js);
+            Log("Applied state to page: shortcut=" + state);
         }
 
-        // ---- ホットキー登録 ----
         private bool EnableShortcut()
         {
+            _userWantsShortcut = true;
+
             if (_hotkeyRegistered)
             {
                 _shortcutEnabled = true;
@@ -167,26 +294,28 @@ namespace _1620kHz_Windows_App
             {
                 _hotkeyRegistered = true;
                 _shortcutEnabled = true;
+                Log($"RegisterHotKey OK: Handle={Handle}");
                 return true;
             }
 
-            // 他アプリと衝突などで失敗
             _shortcutEnabled = false;
+            Log("RegisterHotKey FAILED. Win32Error = " + Marshal.GetLastWin32Error());
             return false;
         }
 
-        // ---- ホットキー解除 ----
         private void DisableShortcut()
         {
+            _userWantsShortcut = false;
+
             if (_hotkeyRegistered)
             {
                 UnregisterHotKey(Handle, HOTKEY_ID);
                 _hotkeyRegistered = false;
             }
             _shortcutEnabled = false;
+            Log("DisableShortcut called");
         }
 
-        // ---- 標準タイトルバー色 ----
         protected override void OnHandleCreated(EventArgs e)
         {
             base.OnHandleCreated(e);
@@ -197,20 +326,65 @@ namespace _1620kHz_Windows_App
             int textColor = ToColorRef(Color.White);
             DwmSetWindowAttribute(Handle, DWMWA_TEXT_COLOR, ref textColor, sizeof(int));
 
-            // ここではホットキー登録しない（デフォルトは false）
+            Log($"OnHandleCreated: Handle={Handle}, userWants={_userWantsShortcut}");
+
+            if (_userWantsShortcut)
+            {
+                _hotkeyRegistered = false;
+                EnableShortcut();
+                Log("Re-registered hotkey on new Handle");
+            }
         }
 
         protected override void OnHandleDestroyed(EventArgs e)
         {
-            DisableShortcut();
+            Log($"OnHandleDestroyed: Handle={Handle}");
+            if (_hotkeyRegistered)
+            {
+                UnregisterHotKey(Handle, HOTKEY_ID);
+                _hotkeyRegistered = false;
+            }
+            _shortcutEnabled = false;
             base.OnHandleDestroyed(e);
         }
 
-        // ---- ホットキー受信 ----
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+#if DEBUG
+            if (!_realExit)
+            {
+                Log("OnFormClosing (DEBUG: exiting)");
+                trayIcon!.Visible = false;
+                trayIcon.Dispose();
+                trayMenu?.Dispose();
+                webView.Dispose();
+                base.OnFormClosing(e);
+                return;
+            }
+#endif
+
+            if (!_realExit && e.CloseReason == CloseReason.UserClosing)
+            {
+                // ★ バルーン通知は削除。静かにトレイへ。
+                e.Cancel = true;
+                Hide();
+                ShowInTaskbar = false;
+                return;
+            }
+
+            trayIcon!.Visible = false;
+            trayIcon.Dispose();
+            trayMenu?.Dispose();
+            webView.Dispose();
+
+            base.OnFormClosing(e);
+        }
+
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == WM_HOTKEY && m.WParam.ToInt32() == HOTKEY_ID)
             {
+                Log("WM_HOTKEY received");
                 ActivateFromHotkey();
                 return;
             }
@@ -220,6 +394,7 @@ namespace _1620kHz_Windows_App
         private void ActivateFromHotkey()
         {
             if (!Visible) Show();
+            ShowInTaskbar = true;
             if (WindowState == FormWindowState.Minimized)
                 ShowWindow(Handle, SW_RESTORE);
 
