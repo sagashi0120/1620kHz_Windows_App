@@ -157,7 +157,7 @@ namespace _1620kHz_Windows_App
         private Label _loadingOverlay = null!;
 
         // バージョン
-        private const string VERSION = "0.3.3+--WebViewNative";
+        private const string VERSION = "0.4.0+--WebViewNative";
         private const string PAGE_URL = "https://highwayradio.cloudfree.jp/";
 
         private static string NumericVersion
