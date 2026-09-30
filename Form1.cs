@@ -1,10 +1,12 @@
 using Microsoft.Web.WebView2.WinForms;
+using Microsoft.Win32;
 using System;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
@@ -167,8 +169,156 @@ namespace _1620kHz_Windows_App
             }
         }
 
+        // ---- 設定の永続化（%LOCALAPPDATA%\1620kHz_Windows_App\settings.json） ----
+        private sealed class AppSettings
+        {
+            public bool ShortcutEnabled { get; set; }
+        }
+
+        private static readonly string SettingsDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "1620kHz_Windows_App");
+
+        private static readonly string SettingsPath = Path.Combine(SettingsDir, "settings.json");
+
+        private static readonly JsonSerializerOptions JsonOptions = new()
+        {
+            WriteIndented = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+            PropertyNameCaseInsensitive = true
+        };
+
+        private AppSettings _settings = new();
+
+        private static AppSettings LoadSettings()
+        {
+            try
+            {
+                if (File.Exists(SettingsPath))
+                {
+                    var json = File.ReadAllText(SettingsPath);
+                    var loaded = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions);
+
+                    if (loaded != null)
+                        return loaded;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("LoadSettings EXCEPTION: " + ex.Message);
+            }
+
+            return new AppSettings();
+        }
+
+        private void SaveSettings()
+        {
+            try
+            {
+                Directory.CreateDirectory(SettingsDir);
+
+                File.WriteAllText(SettingsPath, JsonSerializer.Serialize(_settings, JsonOptions));
+
+                Log($"SaveSettings: shortcut={_settings.ShortcutEnabled}");
+            }
+            catch (Exception ex)
+            {
+                Log("SaveSettings EXCEPTION: " + ex.Message);
+            }
+        }
+
+        // ---- 自動起動（HKCU\Software\Microsoft\Windows\CurrentVersion\Run） ----
+        private const string AutoStartRegistryPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
+        private const string AutoStartValueName = "1620kHz-Windows-App";
+
+        private static string ExecutablePath =>
+            Environment.ProcessPath ?? Application.ExecutablePath;
+
+        private static string AutoStartCommand => "\"" + ExecutablePath + "\"";
+
+        private static bool IsAutoStartEnabled()
+        {
+            try
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegistryPath, false);
+                return key?.GetValue(AutoStartValueName) != null;
+            }
+            catch (Exception ex)
+            {
+                Log("IsAutoStartEnabled EXCEPTION: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static bool EnableAutoStart()
+        {
+            try
+            {
+                using var key = Registry.CurrentUser.CreateSubKey(AutoStartRegistryPath, true);
+
+                if (key == null)
+                    return false;
+
+                key.SetValue(AutoStartValueName, AutoStartCommand, RegistryValueKind.String);
+
+                Log("EnableAutoStart: " + AutoStartCommand);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("EnableAutoStart EXCEPTION: " + ex.Message);
+                return false;
+            }
+        }
+
+        private static bool DisableAutoStart()
+        {
+            try
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegistryPath, true);
+
+                if (key?.GetValue(AutoStartValueName) != null)
+                    key.DeleteValue(AutoStartValueName, false);
+
+                Log("DisableAutoStart");
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log("DisableAutoStart EXCEPTION: " + ex.Message);
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// 自動起動が有効なまま exe の場所が変わった場合に、登録パスを現物へ合わせる。
+        /// </summary>
+        private static void RefreshAutoStartPathIfNeeded()
+        {
+            try
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(AutoStartRegistryPath, true);
+
+                if (key?.GetValue(AutoStartValueName) is not string current)
+                    return;
+
+                if (!string.Equals(current, AutoStartCommand, StringComparison.OrdinalIgnoreCase))
+                {
+                    key.SetValue(AutoStartValueName, AutoStartCommand, RegistryValueKind.String);
+                    Log("AutoStart path refreshed: " + AutoStartCommand);
+                }
+            }
+            catch (Exception ex)
+            {
+                Log("RefreshAutoStartPathIfNeeded EXCEPTION: " + ex.Message);
+            }
+        }
+
         public Form1()
         {
+            _settings = LoadSettings();
+            _userWantsShortcut = _settings.ShortcutEnabled;
+
             InitializeComponent();
 
             // === 2つ目のインスタンス：既存を起こして即終了 ===
@@ -185,6 +335,10 @@ namespace _1620kHz_Windows_App
             Log("=== App Start ===");
             Log("Version: " + VERSION);
             Log("ProcessPath: " + (Environment.ProcessPath ?? "(null)"));
+            Log($"Settings: shortcut={_settings.ShortcutEnabled}, autoStart={IsAutoStartEnabled()}, path={SettingsPath}");
+
+            // 自動起動が有効なまま exe が移動していたら登録パスを更新
+            RefreshAutoStartPathIfNeeded();
 
             Text = "ハイウェイラジオ 情報まとめ";
             Width = 1200;
@@ -296,7 +450,7 @@ namespace _1620kHz_Windows_App
                                 }
                             }
 
-                            await ApplyShortcutStateAsync();
+                            await ApplyAppStateAsync();
                         }
                         catch (Exception ex)
                         {
@@ -335,7 +489,12 @@ namespace _1620kHz_Windows_App
                             {
                                 case "enableShortcut":
                                     bool ok = EnableShortcut();
-                                    await ApplyShortcutStateAsync();
+
+                                    // 次回起動時にも復元されるよう設定を保存する
+                                    _settings.ShortcutEnabled = _shortcutEnabled;
+                                    SaveSettings();
+
+                                    await ApplyAppStateAsync();
 
                                     if (!ok)
                                     {
@@ -352,8 +511,36 @@ namespace _1620kHz_Windows_App
 
                                 case "disableShortcut":
                                     DisableShortcut();
-                                    await ApplyShortcutStateAsync();
+
+                                    _settings.ShortcutEnabled = false;
+                                    SaveSettings();
+
+                                    await ApplyAppStateAsync();
                                     webView.CoreWebView2.PostWebMessageAsString("shortcut:false");
+                                    break;
+
+                                case "enableAutoStart":
+                                    bool autoStartOk = EnableAutoStart();
+                                    await ApplyAppStateAsync();
+
+                                    if (!autoStartOk)
+                                    {
+                                        trayIcon?.ShowBalloonTip(
+                                            3000,
+                                            "自動起動の設定失敗",
+                                            "スタートアップへの登録に失敗しました。",
+                                            ToolTipIcon.Warning);
+                                    }
+
+                                    webView.CoreWebView2.PostWebMessageAsString(
+                                        autoStartOk ? "autostart:true" : "autostart:failed");
+                                    break;
+
+                                case "disableAutoStart":
+                                    bool autoStartOff = DisableAutoStart();
+                                    await ApplyAppStateAsync();
+                                    webView.CoreWebView2.PostWebMessageAsString(
+                                        autoStartOff ? "autostart:false" : "autostart:failed");
                                     break;
 
                                 case "queryShortcutState":
@@ -404,7 +591,8 @@ namespace _1620kHz_Windows_App
                     string js = $@"
                         window.APP_INFO_WEBVIEW = Object.freeze({{
                             version: '{VERSION}',
-                            shortcut: false
+                            shortcut: {(_shortcutEnabled ? "true" : "false")},
+                            autoStart: {(IsAutoStartEnabled() ? "true" : "false")}
                         }});
                     ";
 
@@ -683,31 +871,33 @@ del "%~f0"
             trayIcon.DoubleClick += (_, _) => ActivateFromHotkey();
         }
 
-        private async Task ApplyShortcutStateAsync()
+        private async Task ApplyAppStateAsync()
         {
             try
             {
                 if (webView.CoreWebView2 == null) return;
 
                 string state = _shortcutEnabled ? "true" : "false";
+                string autoStart = IsAutoStartEnabled() ? "true" : "false";
 
                 string js = $@"
                     window.APP_INFO_WEBVIEW = Object.freeze({{
                         version: '{VERSION}',
-                        shortcut: {state}
+                        shortcut: {state},
+                        autoStart: {autoStart}
                     }});
                     window.dispatchEvent(new CustomEvent('appinfochange', {{
-                        detail: {{ shortcut: {state} }}
+                        detail: {{ shortcut: {state}, autoStart: {autoStart} }}
                     }}));
                 ";
 
                 await webView.CoreWebView2.ExecuteScriptAsync(js);
 
-                Log("Applied state to page: shortcut=" + state);
+                Log($"Applied state to page: shortcut={state}, autoStart={autoStart}");
             }
             catch (Exception ex)
             {
-                Log("ApplyShortcutStateAsync EXCEPTION: " + ex);
+                Log("ApplyAppStateAsync EXCEPTION: " + ex);
             }
         }
 

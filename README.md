@@ -8,6 +8,8 @@ WebView2 を利用してサイトを表示し、ブラウザでは実現でき�
 
 - **グローバルホットキー**（`Ctrl + Shift + H`）でどこからでも呼び出し
 - **タスクトレイ常駐**（×ボタンで閉じても常駐し、すぐ呼び出せる）
+- **Windows 起動時の自動起動**（サイトの「設定」から ON/OFF）
+- **設定の保存**（ショートカットキー・自動起動の設定を次回起動時にも引き継ぎ）
 - **アプリバージョン確認**（サイトから最新版をチェック、ダウンロードリンクを表示）
 - **Windows のライト/ダークモードに追従**
 - **User-Agent に `HighwayRadioApp/x.x.x` を付加**（サーバー側でアプリからのアクセスを判別可能）
@@ -42,6 +44,15 @@ WebView2 を利用してサイトを表示し、ブラウザでは実現でき�
 > ホットキーはサイトの「設定」→「ショートカットキー」から有効化できます。
 > 他のアプリと競合して登録に失敗した場合は、通知でお知らせします。
 
+### 設定
+
+サイトの「設定」から以下を切り替えられます。設定は保存され、次回起動時にも引き継がれます。
+
+| 設定 | 内容 |
+|---|---|
+| ショートカットキー | `Ctrl + Shift + H` の有効／無効 |
+| Windows 起動時に自動起動 | サインイン時に自動で起動（`HKCU\Software\Microsoft\Windows\CurrentVersion\Run` に登録） |
+
 ### タスクトレイ
 
 - ×ボタンで閉じると、タスクトレイに常駐します（プロセスは終了しません）
@@ -59,6 +70,11 @@ WebView2 を利用してサイトを表示し、ブラウザでは実現でき�
 3. 以下のフォルダにユーザーデータが保存されているので、必要に応じて削除
    ```
    %LOCALAPPDATA%\1620kHz_Windows_App
+   ```
+4. 「Windows 起動時に自動起動」を ON にしていた場合は、レジストリの登録を削除
+   ```
+   HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run
+   （値の名前: 1620kHz-Windows-App）
    ```
 
 ## 開発
@@ -78,6 +94,15 @@ dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 出力先：
 ```
 bin\Release\net10.0-windows\win-x64\publish\
+```
+
+### リリース
+
+[release.ps1](release.ps1) を使うと、バージョン更新から GitHub Release の作成までを 1 コマンドで実行できます。
+
+```powershell
+.\release.ps1 0.4.0            # VERSION 更新 → publish → commit/tag/push → Release 作成
+.\release.ps1 0.4.0 -DryRun    # ビルドと検証のみ（コミット・タグ・push はしない）
 ```
 
 ## ライセンス
