@@ -1,0 +1,48 @@
+## .NET / Visual Studio build output
+bin/
+obj/
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.userprefs
+
+## Build results / publish output
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+[Aa][Rr][Mm]/
+[Aa][Rr][Mm]64/
+publish/
+*.publishsettings
+
+## NuGet
+*.nupkg
+*.snupkg
+packages/
+!packages/build/
+
+## Rider / ReSharper / VS Code
+.idea/
+_ReSharper*/
+*.DotSettings.user
+.vscode/
+
+## WebView2 runtime user data (created at runtime next to the exe)
+*WebView2/
+EBWebView/
+
+## Crash dumps
+*.dmp
+*.mdmp
+*.hdmp
+
+## OS junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
