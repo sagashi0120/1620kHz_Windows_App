@@ -96,6 +96,9 @@ dotnet publish -c Release -r win-x64 --self-contained -p:PublishSingleFile=true
 bin\Release\net10.0-windows\win-x64\publish\
 ```
 
+> `WebView2Loader.dll`（WebView2 がランタイムを探すためのネイティブ DLL）は、csproj の `IncludeNativeLibrariesForSelfExtract` によって exe に同梱されます。
+> この設定を外すと publish フォルダに併置されるだけになり、exe 単体で配布した環境で `WebView2Loader.dll` が見つからず起動に失敗します。
+
 ### リリース
 
 [release.ps1](release.ps1) を使うと、バージョン更新から GitHub Release の作成までを 1 コマンドで実行できます。
