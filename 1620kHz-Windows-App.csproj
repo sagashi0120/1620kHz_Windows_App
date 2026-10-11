@@ -9,6 +9,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AllowUnsafeBlocks>True</AllowUnsafeBlocks>
 	<ApplicationIcon>app.ico</ApplicationIcon>
+
+    <!-- WebView2 のネイティブローダー (WebView2Loader.dll) を exe に同梱する。
+         exe 単体で配布したときに WebView2Loader.dll が見つからない問題の対策。 -->
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
   </PropertyGroup>
 
   <ItemGroup>
